@@ -1,185 +1,184 @@
-# Posture Monitor Application (app.py)
-# Toàn bộ mã nguồn hoàn chỉnh của chương trình giám sát tư thế bằng MediaPipe và OpenCV:
-# Ref: https://learnopencv.com/building-a-body-posture-analysis-system-using-mediapipe/
+# Posture Monitor - Full Upper Body Detection v3.1
+# Author: GPT-5 for Nguyễn Đình Quân
+# Features:
+# - Detect 13 keypoints: ears, shoulders, elbows, hips, wrists, nose
+# - Identify common posture issues: forward head, shoulder imbalance, slouching, leaning, arm support
+# - Multi-angle and smoothed output
+# - Visual skeleton overlay
 
 import cv2
-import math as m
+import math
 import mediapipe as mp
+from collections import deque
 import argparse
-import sys
 
-mp_drawing = mp.solutions.drawing_utils
 mp_pose = mp.solutions.pose
+SMOOTH_WINDOW = 5  # smoothing frame window
 
-def findDistance(x1, y1, x2, y2):
-    """Tính khoảng cách Euclid giữa hai điểm."""
-    return m.sqrt((x2 - x1) ** 2 + (y2 - y1) ** 2)
-
-def findAngle(x1, y1, x2, y2):
-    """Tính góc giữa hai điểm với trục y."""
-    y1s = y1 if y1 != 0 else 1e-6
-    denom = m.sqrt((x2 - x1) ** 2 + (y2 - y1) ** 2) * y1s
-    denom = denom if denom != 0 else 1e-6
-    theta = m.acos((y2 - y1) * (-y1s) / denom)
-    return int(180 / m.pi * theta)
-
-def sendWarning():
-    """Hàm cảnh báo tư thế xấu quá lâu."""
-    print("⚠️  Cảnh báo: Tư thế xấu quá lâu!")
-
-def parse_arguments():
-    """Parse các tham số khi chạy chương trình."""
-    p = argparse.ArgumentParser(description="Posture Monitor with MediaPipe")
-    p.add_argument("--video", type=str, default="0", help="Đường dẫn video, hoặc số index webcam (vd: 0).")
-    p.add_argument("--offset-threshold", type=int, default=100, help="Ngưỡng cân vai (px).")
-    p.add_argument("--neck-angle-threshold", type=int, default=25, help="Ngưỡng góc cổ (độ).")
-    p.add_argument("--torso-angle-threshold", type=int, default=10, help="Ngưỡng góc thân (độ).")
-    p.add_argument("--time-threshold", type=int, default=180, help="Ngưỡng thời gian tư thế xấu để cảnh báo (s).")
-    p.add_argument("--show", action="store_true", help="Hiển thị cửa sổ (dùng khi chạy local).")
-    p.add_argument("--output", type=str, default="output.mp4", help="Tên file video kết quả.")
+def parse_args():
+    p = argparse.ArgumentParser()
+    p.add_argument("--video", type=str, default="0", help="Path to video file or webcam index (0).")
+    p.add_argument("--time-threshold", type=float, default=30)
+    p.add_argument("--show", action="store_true")
+    p.add_argument("--output", type=str, default="output.mp4")
     return p.parse_args()
 
-def main(video_path, offset_threshold=100, neck_angle_threshold=25, torso_angle_threshold=10, time_threshold=180, show=False, output_path="output.mp4"):
-    good_frames, bad_frames = 0, 0
-    font = cv2.FONT_HERSHEY_SIMPLEX
-    blue = (255, 127, 0)
-    red = (50, 50, 255)
-    green = (127, 255, 0)
-    light_green = (127, 233, 100)
-    yellow = (0, 255, 255)
-    pink = (255, 0, 255)
-    white = (255, 255, 255)
+def mid(a, b): return ((a[0] + b[0]) / 2, (a[1] + b[1]) / 2)
+def vec(a, b): return (b[0] - a[0], b[1] - a[1])
+def dist(a, b): return math.hypot(a[0] - b[0], a[1] - b[1])
 
-    # Mở video hoặc webcam
-    if str(video_path).isdigit():
-        cap = cv2.VideoCapture(int(video_path))
-    else:
-        cap = cv2.VideoCapture(video_path)
+def angle(v1, v2):
+    dot = v1[0] * v2[0] + v1[1] * v2[1]
+    mag = math.hypot(v1[0], v1[1]) * math.hypot(v2[0], v2[1])
+    if mag == 0: return 0
+    ang = math.degrees(math.acos(max(min(dot / mag, 1), -1)))
+    return ang
+
+def angle_with_vertical(v):
+    dx, dy = v
+    ang = abs(math.degrees(math.atan2(dx, -dy)))
+    return min(ang, 180)
+
+def get_point(lm, idx, w, h):
+    p = lm[idx]
+    return (p.x * w, p.y * h), p.visibility
+
+def main():
+    args = parse_args()
+    cap = cv2.VideoCapture(int(args.video) if str(args.video).isdigit() else args.video)
     if not cap.isOpened():
-        print("❌ Không mở được video/camera.")
+        print("❌ Không mở được video.")
         return
 
-    width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH) or 1280)
-    height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT) or 720)
+    w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH) or 1280)
+    h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT) or 720)
     fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
-    out = cv2.VideoWriter(output_path, cv2.VideoWriter_fourcc(*"mp4v"), fps if fps > 1 else 30.0, (width, height))
+    out = cv2.VideoWriter(args.output, cv2.VideoWriter_fourcc(*"mp4v"), fps, (w, h))
+    pose = mp_pose.Pose(min_detection_confidence=0.5, min_tracking_confidence=0.5)
 
-    pose = mp_pose.Pose()
+    neck_buf, torso_buf = deque(maxlen=SMOOTH_WINDOW), deque(maxlen=SMOOTH_WINDOW)
+    bad_frames, good_frames = 0, 0
+
+    font = cv2.FONT_HERSHEY_SIMPLEX
+    C = {"g": (0, 255, 0), "r": (0, 0, 255), "y": (0, 255, 255), "w": (255, 255, 255)}
 
     while True:
-        ok, image = cap.read()
-        if not ok:
-            print("🔹 Không còn khung hình (hết video hoặc lỗi camera).")
-            break
+        ok, frame = cap.read()
+        if not ok: break
 
-        rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
-        result = pose.process(rgb)
-        image = cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
-        h, w = image.shape[:2]
+        rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        res = pose.process(rgb)
+        frame = cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
 
-        if not result.pose_landmarks:
-            out.write(image)
-            if show:
-                cv2.imshow("Posture", image)
-                if cv2.waitKey(1) & 0xFF == ord('q'):
-                    break
+        if not res.pose_landmarks:
+            out.write(frame)
             continue
 
-        lm = result.pose_landmarks.landmark
-        lmPose = mp_pose.PoseLandmark
+        lm = res.pose_landmarks.landmark
+        L = mp_pose.PoseLandmark
 
-        # Lấy các điểm quan trọng
-        l_shldr_x = int(lm[lmPose.LEFT_SHOULDER].x * w)
-        l_shldr_y = int(lm[lmPose.LEFT_SHOULDER].y * h)
-        r_shldr_x = int(lm[lmPose.RIGHT_SHOULDER].x * w)
-        r_shldr_y = int(lm[lmPose.RIGHT_SHOULDER].y * h)
-        l_ear_x = int(lm[lmPose.LEFT_EAR].x * w)
-        l_ear_y = int(lm[lmPose.LEFT_EAR].y * h)
-        l_hip_x = int(lm[lmPose.LEFT_HIP].x * w)
-        l_hip_y = int(lm[lmPose.LEFT_HIP].y * h)
+        # --- Get 13 keypoints ---
+        pts = {}
+        for name, idx in [
+            ("LEar", L.LEFT_EAR), ("REar", L.RIGHT_EAR),
+            ("LShoulder", L.LEFT_SHOULDER), ("RShoulder", L.RIGHT_SHOULDER),
+            ("LElbow", L.LEFT_ELBOW), ("RElbow", L.RIGHT_ELBOW),
+            ("LWrist", L.LEFT_WRIST), ("RWrist", L.RIGHT_WRIST),
+            ("LHip", L.LEFT_HIP), ("RHip", L.RIGHT_HIP),
+            ("Nose", L.NOSE)
+        ]:
+            pts[name], _ = get_point(lm, idx, w, h)
 
-        # Tính offset vai
-        offset = int(findDistance(l_shldr_x, l_shldr_y, r_shldr_x, r_shldr_y))
-        right_text = f"{offset} Shoulders aligned" if offset < offset_threshold else f"{offset} Shoulders not aligned"
-        right_color = green if offset < offset_threshold else red
-        cv2.putText(image, right_text, (w - 280, 30), font, 0.6, right_color, 2)
+        # --- Compute reference midpoints ---
+        mid_sh = mid(pts["LShoulder"], pts["RShoulder"])
+        mid_ear = mid(pts["LEar"], pts["REar"])
+        mid_hip = mid(pts["LHip"], pts["RHip"])
+        neck = mid(mid_sh, mid_ear)
 
-        # Tính góc cổ và thân
-        neck_inclination = findAngle(l_shldr_x, l_shldr_y, l_ear_x, l_ear_y)
-        torso_inclination = findAngle(l_hip_x, l_hip_y, l_shldr_x, l_shldr_y)
+        # --- Angles ---
+        neck_vec = vec(mid_sh, mid_ear)
+        torso_vec = vec(mid_hip, mid_sh)
+        spine_vec = vec(mid_hip, mid_ear)
 
-        # Vẽ các landmark
-        cv2.circle(image, (l_shldr_x, l_shldr_y), 7, white, 2)
-        cv2.circle(image, (l_ear_x, l_ear_y), 7, white, 2)
-        cv2.circle(image, (l_shldr_x, l_shldr_y - 100), 7, white, 2)
-        cv2.circle(image, (r_shldr_x, r_shldr_y), 7, pink, -1)
-        cv2.circle(image, (l_hip_x, l_hip_y), 7, yellow, -1)
-        cv2.circle(image, (l_hip_x, l_hip_y - 100), 7, yellow, -1)
+        neck_angle = angle_with_vertical(neck_vec)
+        torso_angle = angle_with_vertical(torso_vec)
 
-        # Kiểm tra tư thế tốt hay xấu
-        good_posture = (neck_inclination < neck_angle_threshold and torso_inclination < torso_angle_threshold)
-        if good_posture:
-            bad_frames = 0
-            good_frames += 1
-            line_color = green
-            text_color = light_green
-        else:
-            good_frames = 0
+        neck_buf.append(neck_angle)
+        torso_buf.append(torso_angle)
+        s_neck = sum(neck_buf) / len(neck_buf)
+        s_torso = sum(torso_buf) / len(torso_buf)
+
+        # --- Posture issues detection ---
+        shoulder_diff = abs(pts["LShoulder"][1] - pts["RShoulder"][1])
+        shoulder_imbalance = shoulder_diff > 40
+
+        ear_shoulder_dist = dist(mid_ear, mid_sh)
+        fwd_head = ear_shoulder_dist > (0.22 * w)
+
+        spine_angle = angle_with_vertical(spine_vec)
+        slouch = spine_angle > 20
+
+        l_elbow_angle = angle(vec(pts["LShoulder"], pts["LElbow"]), vec(pts["LElbow"], pts["LWrist"]))
+        r_elbow_angle = angle(vec(pts["RShoulder"], pts["RElbow"]), vec(pts["RElbow"], pts["RWrist"]))
+        arm_support = l_elbow_angle < 50 or r_elbow_angle < 50
+
+        issues = []
+        if fwd_head: issues.append("Head forward")
+        if slouch: issues.append("Slouching")
+        if shoulder_imbalance: issues.append("Uneven shoulders")
+        if arm_support: issues.append("Arm support")
+        bad_posture = len(issues) > 0
+
+        # --- Posture logic ---
+        if bad_posture:
             bad_frames += 1
-            line_color = red
-            text_color = red
-
-        # Vẽ các đường nối
-        cv2.line(image, (l_shldr_x, l_shldr_y), (l_ear_x, l_ear_y), line_color, 2)
-        cv2.line(image, (l_shldr_x, l_shldr_y), (l_shldr_x, l_shldr_y - 100), line_color, 2)
-        cv2.line(image, (l_hip_x, l_hip_y), (l_shldr_x, l_shldr_y), line_color, 2)
-        cv2.line(image, (l_hip_x, l_hip_y), (l_hip_x, l_hip_y - 100), line_color, 2)
-
-        # Hiển thị góc và thời gian tư thế
-        cv2.putText(image, f"Neck inclination: {int(neck_inclination)}", (10, 20), font, 0.6, text_color, 2)
-        cv2.putText(image, f"Torso inclination: {int(torso_inclination)}", (10, 45), font, 0.6, text_color, 2)
-        _fps = cap.get(cv2.CAP_PROP_FPS) or fps or 30.0
-        good_time = (1.0 / _fps) * good_frames
-        bad_time = (1.0 / _fps) * bad_frames
-
-        if good_time > 0:
-            cv2.putText(image, f"Good Posture Time : {round(good_time,1)}s", (10, h - 15), font, 0.7, green, 2)
+            good_frames = 0
+            color = C["r"]
         else:
-            cv2.putText(image, f"Bad Posture Time : {round(bad_time,1)}s", (10, h - 15), font, 0.7, red, 2)
+            good_frames += 1
+            bad_frames = 0
+            color = C["g"]
 
-        if bad_time > time_threshold:
-            sendWarning()
-            cv2.putText(image, "BAD POSTURE TOO LONG!", (int(w*0.25), int(h*0.1)), font, 1.0, red, 3)
+        # --- Draw skeleton ---
+        for name in pts:
+            cv2.circle(frame, tuple(map(int, pts[name])), 4, C["w"], -1)
 
-        # Ghi ra file
-        out.write(image)
+        for a, b in [
+            ("LShoulder", "RShoulder"),
+            ("LEar", "REar"),
+            ("LHip", "RHip"),
+            ("LShoulder", "LElbow"),
+            ("RShoulder", "RElbow"),
+            ("LElbow", "LWrist"),
+            ("RElbow", "RWrist"),
+            ("LShoulder", "LHip"),
+            ("RShoulder", "RHip")
+        ]:
+            cv2.line(frame, tuple(map(int, pts[a])), tuple(map(int, pts[b])), C["y"], 2)
 
-        # Hiển thị màn hình (nếu bật --show)
-        if show:
-            cv2.imshow("Posture", image)
-            if cv2.waitKey(1) & 0xFF == ord('q'):
-                break
+        # --- Text display ---
+        cv2.putText(frame, f"Neck: {s_neck:.1f}°  Torso: {s_torso:.1f}°", (10, 25), font, 0.6, color, 2)
+        fps_ = fps if fps > 1 else 30
+        good_time, bad_time = good_frames / fps_, bad_frames / fps_
+
+        if bad_time > args.time_threshold:
+            cv2.putText(frame, "⚠️ BAD POSTURE TOO LONG!", (int(w * 0.25), int(h * 0.1)), font, 1.0, C["r"], 3)
+
+        if bad_posture:
+            y0 = 55
+            for i, txt in enumerate(issues):
+                cv2.putText(frame, f"- {txt}", (10, y0 + 25 * i), font, 0.6, C["r"], 2)
+        else:
+            cv2.putText(frame, "Good posture", (10, 55), font, 0.7, C["g"], 2)
+
+        out.write(frame)
+        if args.show:
+            cv2.imshow("Posture Monitor", frame)
+            if cv2.waitKey(1) & 0xFF == ord('q'): break
 
     cap.release()
     out.release()
-    if show:
-        cv2.destroyAllWindows()
-    print(f"✅ Xong! Video kết quả: {output_path}")
+    print(f"✅ Done! Output saved to {args.output}")
 
 if __name__ == "__main__":
-    args = parse_arguments()
-    print("Arguments:")
-    print(f"Video: {args.video}")
-    print(f"Offset Threshold: {args.offset_threshold}")
-    print(f"Neck Angle Threshold: {args.neck_angle_threshold}")
-    print(f"Torso Angle Threshold: {args.torso_angle_threshold}")
-    print(f"Time Threshold: {args.time_threshold}")
-    main(
-        video_path=args.video,
-        offset_threshold=args.offset_threshold,
-        neck_angle_threshold=args.neck_angle_threshold,
-        torso_angle_threshold=args.torso_angle_threshold,
-        time_threshold=args.time_threshold,
-        show=args.show,
-        output_path=args.output
-    )
+    main()
